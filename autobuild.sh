@@ -1,5 +1,6 @@
 set -x
-rm -rf `pwd`/build/*
-cd `pwd`/build &&
-	cmake .. &&
+mkdir -p ../build
+rm -rf ../build/*
+cd ../build &&
+	cmake ../chatserver-moduo-mysql-nginx-redis &&
 	make
