@@ -55,7 +55,7 @@ string getCurrentTime()
     return string(buffer);
 }
 
-//连天客户端程序实现，main线程用作发送线程，子线程用作接收线程
+//聊天客户端程序实现，main线程用作发送线程，子线程用作接收线程
 int main(int argc, char **argv)
 {
     if(argc<3)
@@ -280,21 +280,30 @@ void doLoginResponse(json &responsejs)
     }
 }
 
+int recv_all(int fd, void* buf, int len)
+{
+    int total = 0;
+    while (total < len)
+    {
+        int n = recv(fd, (char*)buf + total, len - total, 0);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return total;
+}
+
 //子线程-接收线程
 void readTaskHandler(int clientfd)
 {
     while(1)
     {
-        char buffer[1024] = {0};
-        int len = recv(clientfd, buffer, 1024, 0); 
-        if(-1 == len || 0 == len)
-        {
-            close(clientfd);
-            exit(-1);
-        }
-
+        uint32_t net_len;
+        recv_all(clientfd, &net_len, 4);
+        uint32_t len = ntohl(net_len);
+        std::string body(len, 0);
+        recv_all(clientfd, body.data(), len);
         //接收ChatServer转发的数据，反序列化生成json数据对象
-        json js = json::parse(buffer);
+        json js = json::parse(body);
         int msgtype = js["msgid"].get<int>();
         if(ONE_CHAT_MSG == msgtype)
         {
