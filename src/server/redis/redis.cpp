@@ -90,6 +90,7 @@ bool Redis::subscribe(int channel)
 //向redis指定的通道unsubscrib取消订阅消息
 bool Redis::unsubscribe(int channel)
 {
+    // 追加命令到缓冲区，不会立刻发送到网络
     if(REDIS_ERR == redisAppendCommand(this->_subcribe_context, "UNSUBSCRIBE %d", channel))
     {
         cerr << "unsubscribe command failed!" << endl;

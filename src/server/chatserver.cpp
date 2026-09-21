@@ -8,7 +8,7 @@ using namespace std;
 using namespace std::placeholders;
 using json = nlohmann::json;
 
-//初始化连天服务器对象
+//初始化聊天服务器对象
 ChatServer::ChatServer(EventLoop* loop,
             const InetAddress& listenAddr,
             const string& nameArg)
