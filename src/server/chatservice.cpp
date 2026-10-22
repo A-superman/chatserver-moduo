@@ -129,7 +129,7 @@ void ChatService::login(const TcpConnectionPtr &conn, json &js, Timestamp time)
                 }
                 response["friends"] = vec2;
             }
-            //查新用户的群组信息
+            //查询用户的群组信息
             vector<Group> groupuserVec = _groupModel.queryGroups(id);
             if(!groupuserVec.empty())
             {

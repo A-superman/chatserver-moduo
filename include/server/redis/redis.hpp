@@ -23,7 +23,7 @@ public:
     //向redis指定的通道unsubscrib取消订阅消息
     bool unsubscribe(int channel);
 
-    //在独立线程中接收宋悦通道中的消息
+    //在独立线程中接收订阅通道中的消息
     void observer_channel_message();
 
     //初始化向业务层上报通道消息的回调对象

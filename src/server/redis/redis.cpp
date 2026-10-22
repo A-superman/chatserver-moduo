@@ -3,7 +3,7 @@
 using namespace std;
 
 Redis::Redis()
-:_publish_context(nullptr), _subcribe_context(nullptr){}
+    :_publish_context(nullptr), _subcribe_context(nullptr){}
 Redis::~Redis()
 {
     if(_publish_context != nullptr)
@@ -133,3 +133,23 @@ void Redis::init_notify_handler(function<void(int, string)> fn)
 {
     this->_notify_message_handler = fn;
 }
+
+/*
+bchao@LAPTOP-81L0M6BK:~/CppProgram/chatserver-moduo$ redis-cli
+127.0.0.1:6379> subscribe mychannel
+Reading messages... (press Ctrl-C to quit)
+1) "subscribe"
+2) "mychannel"
+3) (integer) 1
+
+                                        bchao@LAPTOP-81L0M6BK:~/CppProgram/chatserver-moduo/build/bin$ redis-cli
+                                        127.0.0.1:6379> publish mychannel hello
+                                        (integer) 1
+                                        127.0.0.1:6379> 
+
+1) "message"
+2) "mychannel"
+3) "hello"
+
+
+*/
