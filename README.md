@@ -533,3 +533,130 @@ ChatServer 两个实例**不 enable**，要用时手动起（命令见 B.3）。
 [WSL] sudo cp /etc/wsl.conf.bak-20261022 /etc/wsl.conf
 [Windows] wsl --shutdown
 ```
+
+---
+
+# 附录 C：压测结果（2026-10-28 实测）
+
+## C.1 测试环境与工具
+
+| 项 | 值 |
+| --- | --- |
+| 机器 | 本机 WSL2（Debian 11），8 逻辑处理器，内存 3.8 GB |
+| 被测 | `ChatServer`（`chatserver-moduo/build/bin`，`-O0 -g`，未加优化） |
+| 依赖 | MariaDB 10.5.29、redis 6.0.16，均与 ChatServer **同机** |
+| 服务端线程 | `src/server/chatserver.cpp:22` 的 `setThreadNum(4)` → 1 个 accept 线程 + 4 个 IO 线程，实测 `/proc/<pid>/task` = **5 线程** |
+| 测试端口 | **7001 / 7002**（独立实例，未占用集群的 6001/6002，也没经过 nginx） |
+| fd 上限 | `Max open files = 10240`（soft） |
+| 压测客户端 | `~/CppProgram/loadtest/chatload.py`（Python 3.9 asyncio，**放在仓库外**），协议按 `src/client/main.cpp` 与 `src/server/chatservice.cpp:13` 实现：收 `4 字节网络序长度 + JSON`，发 `JSON + \0` |
+
+**最大的局限**：压测客户端和服务端在**同一台机器上抢 CPU**，所以吞吐数字只能用于「找瓶颈」和「比较相对变化」，不能当容量规划用。
+
+## C.2 核心结果
+
+### 吞吐与延迟（登录，40 个用户/轮，每轮换新进程）
+
+| 并发 | QPS | p50 | p95 | 服务端是否存活 |
+| --- | --- | --- | --- | --- |
+| 1（串行） | 18.5/s | 50.9 ms | 56.7 ms | 存活 |
+| 2 | 29.9/s | 58.9 ms | 75.9 ms | 存活 |
+| 3 | 39.1/s | 62.8 ms | 73.5 ms | 存活 |
+| 5 | 39.7/s | 70.2 ms | 119.6 ms | 存活 |
+| 10 | 11.3 ~ 53.3/s（波动大） | 114 ~ 157 ms | 174 ~ 224 ms | **6 次中崩 2 次** |
+| 20 | 52.9/s | 205.0 ms | 344.1 ms | 存活（侥幸） |
+| 200 同时 | — | — | — | **必崩** |
+
+注册（串行单连接）：**33.8 次/秒**，即约 30 ms/次。
+
+### 并发容量（串行登录建立后保持连接，`HOLDC=1`）
+
+| 保持的已登录连接数 | 结果 | 服务端 fd | 服务端 RSS | 线程数 | MariaDB `Threads_connected` |
+| --- | --- | --- | --- | --- | --- |
+| 200 | 全部成功，保持 8s 无异常 | 223 | 9.4 MB | 5 | 4 |
+| 600 | 全部成功，保持 8s 无异常 | 623 | 10.5 MB | 5 | 5 |
+
+按 `Max open files=10240` 推算，fd 层面还能撑到约 1 万连接；**连接数本身不是瓶颈**。
+
+### 消息吞吐（同机转发，50 对 × 20 轮 = 1000 条）
+
+`received=1000/1000`，`p50=25.9ms p95=37.0ms p99=39.0ms`，标称 `236.5 msg/s`。
+
+> **这个数字不可信**：客户端每轮之间 `sleep(0.2)`，20 轮就是 4 秒，而 `send_wall` 总共才 4.23 秒——也就是说 236.5 msg/s 基本是被我自己的 sleep 除出来的，**是下限不是上限**。要测真实上限得去掉 pacing 重跑。延迟分位（p50 25.9ms）同样包含排队时间，只能当参考。
+
+## C.3 压出来的真问题：redis 上下文被多线程共享，导致堆破坏崩溃
+
+这是本次压测最重要的产出，**功能测试完全发现不了**（单客户端跑一天也不崩）。
+
+### 现象
+
+| 触发方式 | 结果 |
+| --- | --- |
+| 200 个连接同时登录 | `Aborted (core dumped)`，signal 6 |
+| 600 个连接**同时断开** | 2/2 次必崩，日志 `double free` |
+| 跨服务器发 4 对 × 10 条消息（走 `redis.publish`） | 服务端 core dump，客户端 `ConnectionResetError` |
+| 10 个并发登录 | 6 次崩 2 次 |
+
+### ASan 定位（不改源码，单独用 g++ 加 `-fsanitize=address` 编一份）
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+READ of size 52, thread T3 (ChatServer2)
+  #1 redisBufferWrite (libhiredis.so.0.14)
+  #2 Redis::subscribe(int)      src/server/redis/redis.cpp:78
+  #3 ChatService::login(...)    src/server/chatservice.cpp:98
+  #12 ChatServer::onMessage(... src/server/chatserver.cpp:53
+
+0x606000003bc3 is located 3 bytes inside of 56-byte region
+freed by thread T4 (ChatServer3) here:      ← 一个 IO 线程释放
+previously allocated by thread T3 (ChatServer2) here:  ← 另一个 IO 线程分配
+```
+
+### 成因（结论，不含修复代码）
+
+`Redis` 是 `ChatService` 的单例成员，内部只有一对裸指针 `_publish_context` / `_subcribe_context`（`include/server/redis/redis.hpp:34,37`）。`Redis::subscribe()` / `unsubscribe()` 对 `_subcribe_context` 做 `redisAppendCommand` + `while(!done) redisBufferWrite(...)`，**全程没有任何锁**；`publish` 同理。
+
+而 `setThreadNum(4)` 让每条 TCP 连接的回调在**不同的 IO 线程**上执行。于是两个用户同时登录（或同时断开）时，两个线程并发读写同一个 hiredis 上下文的内部缓冲区，把它自己的 `redisBuffer` 指针搞乱 → 重复释放 → glibc `free(): invalid pointer` / `double free` → abort。
+
+ASan 那句「T3 分配、T4 释放」就是这件事的直接证据：同一块内存在两个 IO 线程手里被操作。
+
+### 可以怎么往下查（不替你写）
+
+1. 用 `-fsanitize=thread` 再编一份，TSan 会直接把「哪两行在竞争同一个地址」报出来，比 ASan 更对症。
+2. 关键判断点是：**业务回调到底跑在哪个 loop 上**。`setThreadNum(4)` 意味着跑在 4 个 IO 线程之一，而 `Redis`/`_userConnMap`/各个 model 都是全局单例——要么让这些状态只被一个线程访问（例如把业务处理投递回 base loop 串行执行），要么给每个用到共享 context 的地方加锁。
+3. 验证修复的判据（可判定）：`600 个连接同时断开` 与 `200 个连接同时登录` 两个场景各跑 10 次，`pgrep -f "ChatServer 127.0.0.1 700" | wc -l` 必须 10 次都是 1，且日志里没有 `double free` / `invalid pointer`。
+
+## C.4 瓶颈定位：慢在数据库访问方式，不是连接数
+
+- 串行登录 **p50 ≈ 51ms**、注册 ≈ 30ms。对同机 localhost 来说这个量级不正常。
+- 但 MariaDB 侧 `Threads_connected` 在 600 个在线用户时**只有 4~5**，`Max_used_connections=7`，`Aborted_connects=0` → **不是连接数耗尽**（`max_connections=151` 差得远）。我最初的这个猜测被实测否证了。
+- 真正的原因有两条，都能对上数据：
+  1. **每个请求新建一次数据库连接**：`db.cpp` 的用法是在每个模型方法里 `MySQL mysql;` 局部对象 + `connect()`，用完即析构关闭。ASan 那轮日志里崩溃前已经打出 **46 条 `connect mysql success!`**，而登录一次要走 `query(id)` + `updateState()` 两个方法 = 两次建连。
+  2. **每条写事务都 fsync**：实测 `innodb_flush_log_at_trx_commit = 1`（默认），注册/登录都带 INSERT/UPDATE，在 WSL2 的 ext4 上每次 fsync 就是几十毫秒量级——正好对上 30~50ms 的单请求延迟。
+- 因此提升方向是：**复用数据库连接**（单例/连接池，或把业务收敛到单线程后共用一个连接）与**降低 fsync 频率**（`innodb_flush_log_at_trx_commit=2` 或组提交，代价是崩溃时可能丢 1 秒事务）。前者是代码层面的，后者是配置层面的（`[WSL] sudo mysqld_safe --innodb-flush-log-at-trx-commit=2` 或写进 `/etc/mysql/mariadb.conf.d/` 后重启服务）。
+
+## C.5 复现步骤
+
+```bash
+[WSL] cd ~/CppProgram/loadtest
+# 准备 700 个压测用户（会往 chat 库插入 name like 'load%' 的行）
+[WSL] python3 chatload.py prep 127.0.0.1 7001 700
+# 登录阶梯（HOLDC 控制建立连接的并发；=1 为串行）
+[WSL] HOLDC=1 python3 chatload.py login 127.0.0.1 7001 200 10
+# 并发容量：串行建立 600 个登录态并保持 8 秒
+[WSL] HOLDC=1 python3 chatload.py hold 127.0.0.1 7001 600 8 <ChatServer的pid>
+# 断开风暴：进程退出时 600 个连接一起关（本用例必崩）
+[WSL] HOLDC=1 python3 chatload.py hold 127.0.0.1 7001 600 3
+# ASan 版本（不改源码，单独编）
+[WSL] cd ~/CppProgram/chatserver-moduo && g++ -std=c++17 -g -O0 -fsanitize=address \
+  -Iinclude -Iinclude/server -Iinclude/server/db -Iinclude/server/model -Iinclude/server/redis -Ithirdparty \
+  src/server/*.cpp src/server/db/*.cpp src/server/model/*.cpp src/server/redis/*.cpp \
+  -lmuduo_net -lmuduo_base -lmysqlclient -lhiredis -lpthread -o /tmp/ChatServer.asan
+```
+
+## C.6 遗留与说明
+
+- **测试数据留在库里**：`chat` 库中现有 700 个 `load%` 用户和若干 `offlinemessage`。清理：
+  `mysql -h 127.0.0.1 -u root -p12345678 chat -e "delete from offlinemessage; delete from user where name like 'load%';"`
+- **压测用的 7001/7002 实例已停**，集群的 6001/6002 未参与本轮，也不经过 nginx。**「经 nginx 的入口压测」和「跨服务器在修复后的压测」尚未做**。
+- **日期更正**：附录 A/B 里写的「2026-10-21 / 10-22」是按当时 WSL 的时钟记录的，而那次 WSL 时钟比 Windows 慢（本次实测两边已一致为 2026-10-28）。也就是说 A/B 的日期标注可能整体偏早，事件**先后顺序仍然正确**，但绝对日期请以本附录的 2026-10-28 为参照。
+- 崩溃是**竞态**，不是确定性崩溃：并发≥10 时表现为概率性（实测 6 次崩 2 次），并发越高或断开越集中则越接近必现。

@@ -80,8 +80,8 @@ vector<Group> GroupModel::queryGroups(int userid)
                 GroupUser user;
                 user.setId(atoi(row[0]));
                 user.setName(row[1]);
-                user.setPassword(row[2]);
-                user.setState(row[3]);
+                user.setState(row[2]);
+                user.setRole(row[3]);
                 group.getUsers().push_back(user);
             }
             mysql_free_result(res);
