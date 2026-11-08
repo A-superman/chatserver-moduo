@@ -42,6 +42,8 @@ string getCurrentTime();
 void mainMenu(int);
 //显示当前登录成功用户的基本信息
 void showCurrentUserData();
+//发送一帧：4字节大端长度头 + JSON正文（与ChatServer入站定界对称）
+int sendFrame(int clientfd, const string &body);
 
 //获取系统时间（聊天信息需要添加时间信息）
 string getCurrentTime()
@@ -131,7 +133,7 @@ int main(int argc, char **argv)
 
                 g_isLoginSuccess = false;
                 
-                int len = send(clientfd, request.c_str(), strlen(request.c_str())+1, 0);
+                int len = sendFrame(clientfd, request);
                 if(len == -1)
                 {
                     cerr << "send login msg error:" << request << endl;
@@ -162,7 +164,7 @@ int main(int argc, char **argv)
                 js["password"] = pwd;
                 string request = js.dump();
 
-                int len = send(clientfd, request.c_str(), strlen(request.c_str())+1, 0);
+                int len = sendFrame(clientfd, request);
                 if(len == -1)
                 {
                     cerr << "send reg msg error:" << request << endl;
@@ -290,6 +292,27 @@ int recv_all(int fd, void* buf, int len)
         total += n;
     }
     return total;
+}
+
+int send_all(int fd, const void* buf, int len)
+{
+    int total = 0;
+    while (total < len)
+    {
+        int n = send(fd, (const char*)buf + total, len - total, 0);
+        if (n <= 0) return -1;
+        total += n;
+    }
+    return total;
+}
+
+//长度头不含'\0'，正文就是纯JSON，与服务端出站sendMsg的格式一致
+int sendFrame(int clientfd, const string &body)
+{
+    uint32_t net_len = htonl(static_cast<uint32_t>(body.size()));
+    if (send_all(clientfd, &net_len, sizeof(net_len)) == -1)
+        return -1;
+    return send_all(clientfd, body.data(), static_cast<int>(body.size()));
 }
 
 //子线程-接收线程
@@ -432,7 +455,7 @@ void chat(int clientfd, string str)
     js["time"] = getCurrentTime();
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str())+1, 0);
+    int len = sendFrame(clientfd, buffer);
     if(-1 == len)
     {
         cerr << "send chat msg error -> " << buffer << endl;
@@ -448,7 +471,7 @@ void addfriend(int clientfd, string str)
     js["friendid"] = friendid;
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str())+1, 0);
+    int len = sendFrame(clientfd, buffer);
     if(-1 == len)
     {
         cerr << "send addfriend msg error -> " << buffer << endl;
@@ -471,7 +494,7 @@ void creategroup(int clientfd, string str)
     js["groupname"] = groupname;
     js["groupdesc"] = message;
     string buffer = js.dump();
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str())+1, 0);
+    int len = sendFrame(clientfd, buffer);
     if(len<0)
     {
         cerr<<"send creategroup message error -> " << buffer << endl;
@@ -485,7 +508,7 @@ void addgroup(int clientfd, string str)
     js["id"] = g_currentUser.getId();
     js["groupid"] = atoi(str.c_str());
     string buffer = js.dump();
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str())+1, 0);
+    int len = sendFrame(clientfd, buffer);
     if(len<0)
     {
         cerr << "send addgroup message error -> " << buffer << endl;
@@ -511,7 +534,7 @@ void groupchat(int clientfd, string str)
     js["time"] = getCurrentTime();
     js["name"] = g_currentUser.getName();
     string buffer = js.dump();
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str())+1, 0);
+    int len = sendFrame(clientfd, buffer);
     if(len<0)
     {
         cerr << "groupchat message error -> " << buffer << endl;
@@ -524,7 +547,7 @@ void loginout(int clientfd, string str)
     js["msgid"] = LOGIN_OUT_MSG;
     js["id"] = g_currentUser.getId();
     string buffer = js.dump();
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str())+1, 0);
+    int len = sendFrame(clientfd, buffer);
     if(len<0)
     {
         cerr << "loginout message error -> " << buffer << endl;
